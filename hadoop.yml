@@ -1,0 +1,187 @@
+---
+- name: Launch openstack infra for Hadoop Cluster
+  hosts: localhost
+  gather_facts: false
+  tasks:
+  - name: Launch Openstack instances
+    os_server:
+      name: hadoop-new
+      state: present
+      image: centos_hadoop_new
+      key_name: PdCloudEx-key
+      wait: yes
+      flavor: m1.large
+      auto_floating_ip: yes
+      network: Private
+      meta: 
+        hostname: hadoop.localdomain
+    register: hadoop
+      
+  - name: Wait for SSH on the Instance
+    command: >
+      sshpass -p "{{ instance_password }}" ssh -i /root/.ssh/osp -oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no root@{{hadoop.server.public_v4}}
+    register: result
+    until: result is success
+    retries: 40
+    delay: 10
+
+  - name: Add CentOS Instance to Inventory
+    add_host: 
+      name: hadoop 
+      groups: cluster
+      ansible_ssh_host: "{{ hadoop.server.public_v4 }}"
+      ansible_ssh_user: "root"
+      ansible_ssh_pass: "{{ instance_password }}"
+
+- name: Install JAVA and create a non-root user
+  hosts: cluster
+  remote_user: root
+  gather_facts: false
+  tasks:
+  - name: install wget
+    yum: 
+      name: wget 
+      state: present
+  
+  - name: Install openjdk
+    yum:
+      name: java-1.8.0-openjdk.x86_64
+      state: latest
+  
+  
+ # - name: Create hadoop user
+ #   user:
+ #     name: hadoop
+ #     password: redhat
+ #     shell: /bin/bash
+ #     generate_ssh_key: yes
+ #     ssh_key_bits: 2048
+ #     ssh_key_file: .ssh/id_rsa
+      
+- name: Install Hadoop packages
+  hosts: cluster
+  remote_user: root
+  become: true
+  gather_facts: false
+  tasks: 
+  - name: Download the hadoop package
+    get_url:
+      url: http://www-eu.apache.org/dist/hadoop/common/hadoop-3.1.1/hadoop-3.1.1.tar.gz
+      dest: /home/hadoop
+  
+  - name: Unarchive the hadoop pkg
+    unarchive:
+      src: /home/hadoop/hadoop-3.1.1.tar.gz
+      dest: /home/hadoop
+      remote_src: yes
+      
+  - name: Set the Hadoop environment variables
+    blockinfile:
+      path: /root/.bash_profile
+      block: |
+        export JAVA_HOME=/usr/lib/jvm/jre-1.8.0-openjdk
+        export JRE_HOME=/usr/lib/jvm/jre
+        export HADOOP_HOME=/home/hadoop/hadoop-3.1.1
+        export HADOOP_INSTALL=/home/hadoop/hadoop-3.1.1
+        export HADOOP_MAPRED_HOME=/home/hadoop/hadoop-3.1.1
+        export HADOOP_COMMON_HOME=/home/hadoop/hadoop-3.1.1
+        export HADOOP_HDFS_HOME=/home/hadoop/hadoop-3.1.1
+        export YARN_HOME=/home/hadoop/hadoop-3.1.1
+        export HADOOP_COMMON_LIB_NATIVE_DIR=/home/hadoop/hadoop-3.1.1/lib/native
+        export PATH=$PATH:$HADOOP_HOME/sbin:$HADOOP_HOME/bin
+        
+  - name: Copy the profile directory and source it and change ownership
+    shell: |
+      cp /root/.bash_profile /home/hadoop
+      source /home/hadoop/.bash_profile
+      chown -R hadoop:hadoop /home/hadoop/*
+      
+  - name: Set the JAVA environment variables
+    lineinfile:
+      path: /home/hadoop/hadoop-3.1.1/etc/hadoop/hadoop-env.sh
+      insertafter: '^#export JAVA_HOME'
+      line: export JAVA_HOME=/usr/lib/jvm/jre-1.8.0-openjdk
+        
+  - name: Edit core-site.xml file
+    blockinfile: 
+      path: /home/hadoop/hadoop-3.1.1/etc/hadoop/core-site.xml
+      insertafter: '^<configuration>'
+      block: |
+        <property>
+          <name>fs.default.name</name>
+          <value>hdfs://localhost:9000</value>
+        </property>
+        
+  - name: Edit hdfs-site.xml file
+    blockinfile: 
+      path: /home/hadoop/hadoop-3.1.1/etc/hadoop/hdfs-site.xml
+      insertafter: '^<configuration>'
+      block: |
+        <property>
+          <name>dfs.replication</name>
+          <value>1</value>
+        </property>
+
+        <property>
+          <name>dfs.name.dir</name>
+          <value>file:///home/hadoop/hadoopdata/hdfs/namenode</value>
+        </property>
+
+        <property>
+          <name>dfs.data.dir</name>
+          <value>file:///home/hadoop/hadoopdata/hdfs/datanode</value>
+        </property>
+        
+  - name: Edit mapred-site.xml file
+    blockinfile: 
+      path: /home/hadoop/hadoop-3.1.1/etc/hadoop/mapred-site.xml
+      insertafter: '^<configuration>'
+      block: |
+        <property>
+          <name>mapreduce.framework.name</name>
+          <value>yarn</value>
+        </property>
+      
+  - name: Edit yarn-site.xml file
+    blockinfile: 
+      path: /home/hadoop/hadoop-3.1.1/etc/hadoop/yarn-site.xml
+      insertafter: '^<configuration>'
+      block: |
+        <property>
+          <name>yarn.nodemanager.aux-services</name>
+          <value>mapreduce_shuffle</value>
+        </property>
+        
+- name: Create hadoop cluster
+  hosts: cluster
+  remote_user: root
+  #become: true
+  gather_facts: false
+  tasks: 
+  #- name: Source the environment file
+  #  shell: 'source /root/.bash_profile'
+  - name: Change ownership
+    shell: 'chown -R hadoop:hadoop /home/hadoop/*'
+    
+  - name: Stop firewalld
+    service:
+      name: firewalld
+      state: stopped
+      
+  - name: Format namenode
+    shell: |
+      set timeout 180
+      su - hadoop
+      cd hadoop-3.1.1
+      bin/hdfs namenode -format
+      exit 0
+    # args:
+    #  chdir: /home/hadoop/hadoop-3.1.1/
+    ignore_errors: yes
+  - name: Start the hadoop cluster
+    shell: |
+      su - hadoop
+      cd hadoop-3.1.1/sbin
+      start-dfs.sh
+      start-yarn.sh
+    ignore_errors: yes
